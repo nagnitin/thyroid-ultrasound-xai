@@ -44,16 +44,18 @@ def primary_summary(cases, external, seed=1729):
     summary = dict(reference_malignant=len(positives), evaluable=len(valid),
                    mean_gap=finite_mean(valid.gap), mean_hotspot_drop=finite_mean(valid.hot_drop),
                    mean_control_drop=finite_mean(valid.control_drop),
+                   mean_null_positive_rate=finite_mean(valid.null_positive_rate) if "null_positive_rate" in valid else None,
                    fraction_with_positive_gap=finite_mean((valid.gap > 0).astype(float)),
                    center_evaluable=int(positives.center_gap.notna().sum()),
                    mean_center_gap=finite_mean(positives.center_gap),
                    mean_box_mass_minus_area=finite_mean(positives.box_excess),
                    mean_box_mass_minus_center_prior=finite_mean(positives.box_minus_center))
-    if external and len(valid) >= 2:
+    if len(valid) >= 2:
         rng = np.random.default_rng(seed)
         delta = valid.gap.to_numpy()
         means = [rng.choice(delta, len(delta), replace=True).mean() for _ in range(BOOT)]
-        summary["mean_gap_patient_bootstrap_95ci"] = np.quantile(means, [0.025, 0.975]).tolist()
+        key = "mean_gap_patient_bootstrap_95ci" if external else "mean_gap_image_bootstrap_95ci"
+        summary[key] = np.quantile(means, [0.025, 0.975]).tolist()
     joint = positives[["gap", "box_excess"]].dropna()
     summary["localization_gap_pairs"] = len(joint)
     summary["spearman_excess_vs_gap"] = None
@@ -103,7 +105,7 @@ def evaluate(args):
         with Image.open(row.image_path) as img:
             gray, valid = fit_image(img)
             roi = fit_roi(row, img.size)
-        r, heat, center = audit_image(model, ck["architecture"], gray, valid, roi, device, args.grid, args.fill)
+        r, heat, center = audit_image(model, ck["architecture"], gray, valid, roi, device, args.grid, args.fill, args.cam)
         r.update(image_id=str(row.image_id), label=int(row.label))
         if external:
             r["patient_id"] = str(row.patient_id)
@@ -111,7 +113,8 @@ def evaluate(args):
         rows.append(r)
     df = pd.DataFrame(rows)
     df.to_csv(out / "view_results.csv", index=False)
-    cols = ["score", "gap", "hot_drop", "control_drop", "center_gap", "box_mass", "box_excess", "box_minus_center"]
+    cols = ["score", "gap", "hot_drop", "control_drop", "null_positive_rate", "center_gap", "box_mass", "box_excess",
+            "box_minus_center"]
     if external:
         cols += ["contour_mass", "contour_excess"]
         # One index nodule per ThyroidXL patient. Each patient receives equal weight.
@@ -122,7 +125,7 @@ def evaluate(args):
         cases = df[["image_id", "label", *cols]].copy()
     cases.to_csv(out / "case_results.csv", index=False)
     summary = dict(phase=args.phase, architecture=ck["architecture"], unit="patient" if external else "image",
-                   grid=args.grid, fill=args.fill, views=len(df),
+                   grid=args.grid, fill=args.fill, cam=args.cam, views=len(df),
                    view_reasons={str(k): int(v) for k, v in df.reason.value_counts().items()},
                    classification=metrics(cases.label, cases.score, ck["threshold"]),
                    primary=primary_summary(cases, external))
@@ -142,5 +145,7 @@ if __name__ == "__main__":
     p.add_argument("--out", required=True)
     p.add_argument("--grid", choices=[4, 8], type=int, default=4)
     p.add_argument("--fill", choices=["blur", "mean"], default="blur")
+    p.add_argument("--cam", choices=["gradcam", "gradcampp"], default="gradcam",
+                   help="Attribution method. The reported study used gradcam.")
     p.add_argument("--threads", type=int, default=4)
     evaluate(p.parse_args())

@@ -87,11 +87,39 @@ python evaluate.py --checkpoint runs/resnet18/best.pt --phase internal --out run
 python paper/external_study.py --project . --archives data/thyus2path --out runs/jiaxing
 ```
 
+The script needs `libarchive-c` (in `requirements.txt`) and the system `libarchive` library to read the `.rar` files. Use `--mobile-run` and `--resnet-run` (paths relative to `--project`) to evaluate other training runs, such as additional seeds, and `--cam gradcampp` for an alternative attribution method. `results.json` keeps the original keys and adds `effect_size`, which reports the contrast in logit units with bootstrap intervals and the random-patch null rate.
+
 For a separate cohort with verified masks, use `evaluate.py --phase external` with a CSV containing `image_id`, `patient_id`, `image_path`, `mask_path`, `label`, and `split`. Use one row per view, binary labels (0 benign, 1 malignant), and `test` for the split. Relative image and mask paths resolve from the CSV directory. Keep generated patient- and view-level outputs local.
 
 ```bash
 python evaluate.py --checkpoint runs/development/best.pt --phase external --csv data/external_test.csv --out runs/external_test
 ```
+
+## Robustness analyses
+
+The reported study used one training seed per architecture and Grad-CAM only. The options below extend it without changing any default, so the default commands still reproduce the reported numbers.
+
+**Several seeds.** Train and evaluate each architecture with several seeds, then summarize the spread.
+
+```bash
+for s in 42 43 44 45 46; do
+  python train.py --model mobilenet --seed $s --out runs/mobile_s$s
+  python train.py --model resnet18 --seed $s --out runs/resnet_s$s
+  python evaluate.py --checkpoint runs/mobile_s$s/best.pt --phase internal --out runs/mobile_s${s}_internal
+  python evaluate.py --checkpoint runs/resnet_s$s/best.pt --phase internal --out runs/resnet_s${s}_internal
+done
+python aggregate_seeds.py "runs/*_internal/summary.json"
+```
+
+**Random-patch baseline and effect size.** `summary.json` and `view_results.csv` include `null_positive_rate`: the share of eligible tiles whose blur effect exceeds the image's mean tile effect. It is the positive-contrast rate an uninformative ranking would give, so compare `fraction_with_positive_gap` with `mean_null_positive_rate`. `mean_gap` is the contrast in logit units, with a bootstrap interval.
+
+**Alternative attribution.** `python evaluate.py ... --cam gradcampp` repeats the audit with Grad-CAM++.
+
+**Model-randomization sanity check.** `python sanity.py --checkpoint runs/development/best.pt --out runs/mobile_sanity` re-initializes the network from the output layer downward and reports how the Grad-CAM map and hotspot statistics change. Maps for the trained model should decorrelate as weights are destroyed.
+
+**Tests.** `python -m unittest discover -s tests` runs offline checks that need no dataset or pretrained weights.
+
+The scripts `paper/verify.py` and `paper/internal_intervals.py` read distributed study outputs (`external/` and `comparison/paired_images.csv`) that are not part of the public source repository.
 
 ## Use the prediction API
 
@@ -118,5 +146,6 @@ The JSON response includes `score`, `threshold`, `above_threshold`, `architectur
 | [explanations.py](explanations.py) and [evaluate.py](evaluate.py) | Grad-CAM, perturbation controls, localization, and evaluation summaries |
 | [review.py](review.py), [app.py](app.py), and [api.py](api.py) | Shared inference, Word reports, Streamlit viewer, and HTTP endpoint |
 | [paper/external_study.py](paper/external_study.py) | Two-model Jiaxing replication and patient-level aggregation |
+| [sanity.py](sanity.py), [aggregate_seeds.py](aggregate_seeds.py), [tests/](tests/) | Randomization sanity check, multi-seed summaries, offline tests |
 
 The original development and internal test used [TN5000](https://doi.org/10.6084/m9.figshare.28455641.v1). The independent Jiaxing study used [ThyUS2Path](https://doi.org/10.6084/m9.figshare.27021604.v1). Consult each dataset’s release page for attribution, access terms, and source documentation.

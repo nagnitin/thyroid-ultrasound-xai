@@ -14,8 +14,14 @@ BLUR_RADIUS = 4
 GRID = 4
 
 
-def gradcam(model, name, gray, device):
-    """Explain the malignant-class logit for every image, including false negatives."""
+def gradcam(model, name, gray, device, method="gradcam"):
+    """Explain the malignant-class logit for every image, including false negatives.
+
+    method="gradcam" is the original behavior. method="gradcampp" uses the Grad-CAM++ channel
+    weighting (Chattopadhay et al., 2018) with the usual closed-form higher-order gradient terms.
+    """
+    if method not in ("gradcam", "gradcampp"):
+        raise ValueError(f"Unknown attribution method: {method}")
     features = []
     def capture(_module, _args, output):
         features.append(output)
@@ -27,7 +33,14 @@ def gradcam(model, name, gray, device):
             logit = model(x).flatten()[0]
             act = features[0]
             grad, = torch.autograd.grad(logit, act)
-            weights = grad.mean(dim=(2, 3), keepdim=True)
+            if method == "gradcam":
+                weights = grad.mean(dim=(2, 3), keepdim=True)
+            else:
+                g2, g3 = grad.pow(2), grad.pow(3)
+                denom = 2 * g2 + act.sum(dim=(2, 3), keepdim=True) * g3
+                alpha = torch.where(grad != 0, g2 / torch.where(denom != 0, denom, torch.ones_like(denom)),
+                                    torch.zeros_like(g2))
+                weights = (alpha * grad.relu()).sum(dim=(2, 3), keepdim=True)
             positive = (weights * act).sum(dim=1, keepdim=True).relu()
             heat = F.interpolate(positive, size=gray.shape, mode="bilinear", align_corners=False)
         return float(logit.detach().cpu()), heat[0, 0].detach().cpu().numpy()
@@ -77,7 +90,7 @@ def patch_scores(model, gray, content, heat, center, base, device, grid=GRID, fi
             hotness.append(heat[tile].mean())
             centrality.append(center[tile].mean())
     result = dict(eligible_tiles=len(inputs), hot_drop=np.nan, control_drop=np.nan,
-                  gap=np.nan, center_gap=np.nan, reason="ok")
+                  gap=np.nan, center_gap=np.nan, null_positive_rate=np.nan, reason="ok")
     if len(inputs) < 2:
         result["reason"] = "fewer_than_two_eligible_tiles"
         return result
@@ -96,14 +109,18 @@ def patch_scores(model, gray, content, heat, center, base, device, grid=GRID, fi
         selected, controls = float(effect[top].mean()), float(effect[~top].mean())
         return selected, controls, selected - controls
     result["hot_drop"], result["control_drop"], result["gap"] = top_contrast(hotness)
+    # Random-patch baseline: if the "hotspot" were any single eligible tile chosen without regard to the
+    # map, its contrast d_j - mean(d_other) is positive exactly when d_j exceeds the mean over all tiles.
+    # The share of such tiles is the positive-contrast rate expected from an uninformative ranking.
+    result["null_positive_rate"] = float((effect > effect.mean() + 1e-12).mean())
     result["center_gap"] = top_contrast(centrality)[2]
     if not np.isfinite(result["gap"]):
         result["reason"] = "flat_or_tied_map"
     return result
 
 
-def audit_image(model, name, gray, content, roi, device, grid=GRID, fill="blur"):
-    base, heat = gradcam(model, name, gray, device)
+def audit_image(model, name, gray, content, roi, device, grid=GRID, fill="blur", method="gradcam"):
+    base, heat = gradcam(model, name, gray, device, method)
     center = centered_prior(content)
     box = tight_box(roi)
     mass, excess, center_diff = localization(heat, center, box, content)

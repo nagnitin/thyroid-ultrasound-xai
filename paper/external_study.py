@@ -1,7 +1,17 @@
-"""Frozen two-model external test. Run beside the supplied project, see REPRODUCE.md."""
+"""Frozen two-model external test on the Jiaxing (ThyUS2Path) archives.
+
+Run from the repository root (see README, "External evaluation"). Defaults reproduce the reported study:
+checkpoints runs/development/best.pt (MobileNetV3-Small) and runs/resnet18/best.pt (ResNet-18),
+Grad-CAM, one index view per patient. Pass --mobile-run/--resnet-run to evaluate another seed and
+--cam gradcampp for an alternative attribution method. Existing keys of results.json are unchanged;
+`effect_size` (logit-unit contrasts and the random-patch null rate) is added.
+"""
 import argparse, hashlib, io, json, sys
 from pathlib import Path
-import libarchive
+try:
+    import libarchive
+except ImportError as exc:  # needs the libarchive-c package and the libarchive system library
+    raise SystemExit("Install libarchive-c (pip install libarchive-c) and the libarchive library to read the .rar archives.") from exc
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -9,22 +19,32 @@ import torch
 from sklearn.metrics import roc_auc_score
 from scipy.stats import rankdata
 
+def md5(path):
+    h=hashlib.md5()
+    with open(path,'rb') as f:
+        for block in iter(lambda:f.read(1<<20),b''):h.update(block)
+    return h.hexdigest()
+
 def main():
-    p=argparse.ArgumentParser()
+    p=argparse.ArgumentParser(description=__doc__)
     for k in ['project','archives','out']:p.add_argument('--'+k,type=Path,required=True)
+    p.add_argument('--mobile-run',type=Path,default=Path('runs/development'),help='MobileNet run folder, relative to --project.')
+    p.add_argument('--resnet-run',type=Path,default=Path('runs/resnet18'),help='ResNet-18 run folder, relative to --project.')
+    p.add_argument('--cam',choices=['gradcam','gradcampp'],default='gradcam')
+    p.add_argument('--threads',type=int,default=3)
     a=p.parse_args();sys.path.insert(0,str(a.project.resolve()))
     from scans import fit_image
     from models import load_checkpoint, predict, metrics
     from explanations import gradcam, centered_prior, patch_scores
     out=a.out;out.mkdir(exist_ok=True,parents=True)
-    torch.set_num_threads(3)
-    ref=a.project/'runs/development'
+    torch.set_num_threads(a.threads)
+    ref=a.project/a.mobile_run
     training_hashes=set(pd.concat([pd.read_csv(ref/f).sha256 for f in ['split_manifest.csv','excluded_views.csv']]))
     items=[]
     missing=[]; unmatched_files=[]
     for batch,checksum in enumerate(['a6fb578883ae70a08fd9e92fa7da7ab5','08d02473840c0e916d5edf6a462026d8'],1):
         archive=a.archives/f'batch{batch}.rar'
-        with archive.open('rb') as file: assert hashlib.file_digest(file,'md5').hexdigest()==checksum
+        assert md5(archive)==checksum,f'{archive} failed its published MD5 digest'
         folder=a.archives/f'extracted{batch}';folder.mkdir(exist_ok=True)
         with libarchive.file_reader(str(archive)) as entries:
             for e in entries:
@@ -54,20 +74,20 @@ def main():
     first=data.drop_duplicates('patient').copy()
     device='cuda' if torch.cuda.is_available() else 'cpu'
     results={}
-    for name,folder in [('mobile','development'),('resnet','resnet18')]:
-        model,ck=load_checkpoint(a.project/'runs'/folder/'best.pt',device)
+    for name,folder in [('mobile',a.mobile_run),('resnet',a.resnet_run)]:
+        model,ck=load_checkpoint(a.project/folder/'best.pt',device)
         pred=predict(model,data,device).set_index('image_id')
         data[name]=data.image_id.map(pred.score)
-        gaps=[]
+        gaps=[];nulls=[]
         for r in first.itertuples():
             with Image.open(r.image_path) as image:gray,content=fit_image(image)
-            logit,heat=gradcam(model,ck['architecture'],gray,device)
+            logit,heat=gradcam(model,ck['architecture'],gray,device,a.cam)
             rr=patch_scores(model,gray,content,heat,centered_prior(content),logit,device)
-            gaps.append(rr['gap'])
-        first[name+'_gap']=gaps
+            gaps.append(rr['gap']);nulls.append(rr['null_positive_rate'])
+        first[name+'_gap']=gaps;first[name+'_null']=nulls
         results[name]={'threshold':ck['threshold']}
         print(name,'finished',flush=True)
-    cases=data.groupby(['patient','batch','label'],as_index=False)[['mobile','resnet']].mean().merge(first[['patient','image_id','mobile_gap','resnet_gap']],on='patient',validate='one_to_one')
+    cases=data.groupby(['patient','batch','label'],as_index=False)[['mobile','resnet']].mean().merge(first[['patient','image_id','mobile_gap','resnet_gap','mobile_null','resnet_null']],on='patient',validate='one_to_one')
     assert cases[['mobile','resnet']].notna().all().all()
     for name in results:
         for group,frame in [('all',cases),*list(cases.groupby('batch'))]:
@@ -83,6 +103,13 @@ def main():
         boots.append([*auc,auc[1]-auc[0],rng.choice(delta,len(delta)).mean()])
     results['ci_columns']=['mobile_auc','resnet_auc','resnet_minus_mobile_auc','mobile_minus_resnet_hotspot_rate']
     results['ci']=np.quantile(boots,[.025,.975],axis=0).tolist()
+    # Effect sizes in logit units. A separate generator keeps the reported bootstrap above bit-for-bit unchanged.
+    eff=np.random.default_rng(74);d=(m.mobile_gap-m.resnet_gap).to_numpy()
+    def ci(v):return np.quantile([eff.choice(v,len(v)).mean() for _ in range(2000)],[.025,.975]).tolist()
+    results['effect_size']={n:{'mean_gap':float(m[n+'_gap'].mean()),'mean_gap_95ci':ci(m[n+'_gap'].to_numpy()),
+        'mean_null_positive_rate':float(m[n+'_null'].mean()),'positive_rate':float(m[n+'_gap'].gt(0).mean())} for n in ('mobile','resnet')}
+    results['effect_size']['mobile_minus_resnet_mean_gap']={'estimate':float(d.mean()),'95ci':ci(d)}
+    results['cam']=a.cam
     results.update(matched_views=len(items),missing_view_links=len(missing),unlinked_files=len(unmatched_files),retained_views=len(data),retained_patients=len(cases),excluded=int(duplicate.sum()))
     cases.to_csv(out/'patients.csv',index=False);data.drop(columns='image_path').to_csv(out/'views.csv',index=False)
     (out/'results.json').write_text(json.dumps(results,indent=2))
