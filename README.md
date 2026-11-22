@@ -1,26 +1,122 @@
 # Thyroid Ultrasound XAI
 
-Research code for classifying known thyroid nodules from ultrasound images with MobileNetV3-Small and ResNet-18. A Streamlit viewer displays the model score and Grad-CAM overlay and can export a Word report. A FastAPI endpoint exposes the same inference workflow.
+How well does a classifier trained on one collection of thyroid ultrasound images perform at another site, and which parts of an image influence its score? This project compares **MobileNetV3-Small** and **ResNet-18** on benign versus malignant classification of a **known thyroid nodule**. It pairs each prediction with a Grad-CAM overlay and tests how the prediction changes when an influential region is blurred.
 
-## Train and run locally
+ResNet-18 achieved an AUROC of **0.901** on the internal image-level test and **0.538** on the independent patient-level test. Both models performed close to chance on the external cohort. The viewer and API are research tools for exploring this behavior. Their scores are uncalibrated and unsuitable for clinical decision-making.
 
-Use Python 3.12 in a virtual environment. Training requires network access for the TN5000 dataset and pretrained initialization. Run from the repository root.
+## Run your first prediction
+
+The public repository contains the source code. Trained checkpoints, ultrasound scans, and patient-level study outputs are separate. To run the viewer from a fresh clone, start with one model.
+
+**1. Install the project.** Use Python 3.12 and run the commands from the repository root.
+
+```bash
+git clone https://github.com/nagnitin/thyroid-ultrasound-xai.git
+cd thyroid-ultrasound-xai
+python -m venv .venv
+```
+
+Activate the environment with `source .venv/bin/activate` on macOS or Linux, or `.venv\Scripts\activate.bat` in Windows Command Prompt.
 
 ```bash
 python -m pip install -r requirements.txt
-python train.py --out runs/development
-python train.py --model resnet18 --out runs/resnet18
+```
+
+**2. Prepare a checkpoint.** Choose the command for the classifier you want. Training downloads TN5000 and the pretrained initialization on first use. If you already have a project checkpoint, place it at the corresponding path and skip that training run.
+
+| Classifier | Training command | Checkpoint expected by the viewer |
+| --- | --- | --- |
+| MobileNetV3-Small | `python train.py --out runs/development` | `runs/development/best.pt` |
+| ResNet-18 | `python train.py --model resnet18 --out runs/resnet18` | `runs/resnet18/best.pt` |
+
+**3. Open the viewer.**
+
+```bash
 python -m streamlit run app.py
 ```
 
-Select a trained classifier and upload a de-identified PNG or JPEG. To launch the API, run `python -m uvicorn api:app --host 127.0.0.1 --port 8000` and open `http://127.0.0.1:8000/docs`. If you already have the project checkpoints, place the two best.pt files in runs/development and runs/resnet18 to skip training.
+Open the local address printed by Streamlit. Select the classifier whose checkpoint you prepared and upload a de-identified PNG or JPEG, up to 8 MiB and 16 megapixels. The viewer shows the preprocessed image, malignant-class overlay, model score, and validation-selected threshold. **Download research report** exports those results as a Word document. Inference uses CUDA when available and otherwise runs on CPU.
 
-## Evaluate
+## Study results
+
+These are aggregate results from the original runs. The internal unit was one TN5000 test image. For the independent Jiaxing evaluation, the study averaged the scores of retained views for each patient before computing classification metrics. The decision threshold for each model was selected on development data and kept fixed for testing.
+
+| Evaluation | MobileNetV3-Small | ResNet-18 |
+| --- | ---: | ---: |
+| Internal AUROC · 941 images | 0.812 | 0.901 |
+| Internal sensitivity | 74.6% | 87.0% |
+| Internal specificity | 74.2% | 75.0% |
+| External AUROC · 737 patients | 0.527 | 0.538 |
+| External sensitivity | 21.5% | 11.0% |
+
+ResNet-18 ranked malignant images more accurately in the internal cohort. At its frozen threshold, it identified only 11.0% of malignant cases in the external cohort. The original training used one seed per architecture, and the internal partitions were image-level. The internal estimates therefore do not establish patient-level generalization.
+
+## How the explanation works
+
+1. **Prepare the input.** The pipeline converts the image to grayscale, resizes it proportionally to fit a 160 × 160 canvas, and pads the remaining space. It replicates grayscale into three channels and normalizes the tensor for the backbone.
+2. **Generate the overlay.** Grad-CAM uses gradients of the malignant-class logit at the final convolutional stage. The viewer overlays the heatmap on the image content and flags a flat map when it has no spatial variation.
+3. **Test the hotspot.** The default evaluation divides the canvas into a 4 × 4 grid. It blurs each eligible tile in turn and compares the logit drop for the hottest tile or tied tiles with the mean drop for the other eligible tiles. A positive gap means blurring the hotspot reduced the malignant-class logit more than blurring the controls. Cases with insufficient eligible tiles or an uninformative map are flagged.
+4. **Check localization.** Where annotations are available, the audit measures the heatmap mass inside the nodule box and compares it with the box’s share of image area and a center-weighted baseline. A large perturbation effect measures model dependence on a region. It does not establish that the predicted label is correct.
+
+## Train and evaluate
+
+The full training defaults are four epochs, batch size 32, and seed 42. Training uses AdamW, selects the checkpoint with the best validation AUROC, and chooses a threshold by maximizing validation sensitivity minus the false-positive rate. A smaller pilot uses stratified subsets of 384 training and 128 validation images.
 
 ```bash
-python evaluate.py --checkpoint runs/development/best.pt --phase internal --out runs/internal
+python train.py --pilot --epochs 2 --out runs/pilot
+python evaluate.py --checkpoint runs/pilot/best.pt --phase validation --out runs/pilot_validation
 ```
 
-The original internal image-level AUROC was 0.812 for MobileNet and 0.901 for ResNet. On the independent Jiaxing cohort the patient-level AUROCs were 0.527 and 0.538 respectively. These models are for research use. The public source release excludes individual study records and scans.
+For a full internal evaluation, first complete the corresponding full training run. Then use a fresh output folder for each evaluation.
 
-Training data: [TN5000](https://doi.org/10.6084/m9.figshare.28455641.v1). External study data: [ThyUS2Path](https://doi.org/10.6084/m9.figshare.27021604.v1).
+```bash
+python evaluate.py --checkpoint runs/development/best.pt --phase internal --out runs/mobile_internal
+python evaluate.py --checkpoint runs/resnet18/best.pt --phase internal --out runs/resnet_internal
+```
+
+| Output | What to use it for |
+| --- | --- |
+| `best.pt`, `run.json`, `history.csv` | Load the selected model and inspect the training configuration and epoch history. |
+| `split_manifest.csv`, `excluded_views.csv`, `validation_ids.csv` | Reconstruct evaluation inputs and check duplicate exclusions. Keep the training manifests beside the checkpoint for evaluation. |
+| `validation_predictions.csv`, `validation_metrics.json` | Inspect validation scores, the selected epoch, and the operating threshold. |
+| `summary.json`, `view_results.csv`, `case_results.csv` | Inspect aggregate evaluation metrics, per-view explanations, and case-level results. |
+
+**External evaluation.** To reproduce the reported Jiaxing study, obtain the two original ThyUS2Path archives, name them `batch1.rar` and `batch2.rar`, and place them in the archives directory. The script checks their digests and expects both checkpoints at the viewer paths above, plus the MobileNet training manifests.
+
+```bash
+python paper/external_study.py --project . --archives data/thyus2path --out runs/jiaxing
+```
+
+For a separate cohort with verified masks, use `evaluate.py --phase external` with a CSV containing `image_id`, `patient_id`, `image_path`, `mask_path`, `label`, and `split`. Use one row per view, binary labels (0 benign, 1 malignant), and `test` for the split. Relative image and mask paths resolve from the CSV directory. Keep generated patient- and view-level outputs local.
+
+```bash
+python evaluate.py --checkpoint runs/development/best.pt --phase external --csv data/external_test.csv --out runs/external_test
+```
+
+## Use the prediction API
+
+Start the API after preparing the MobileNet checkpoint. To select another checkpoint, set the `THYROID_CHECKPOINT` environment variable to its path before starting the server.
+
+```bash
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
+```
+
+Open the [interactive API documentation](http://127.0.0.1:8000/docs), or send a multipart request with a local image using the field `image`. Replace the example path with your own.
+
+```bash
+curl -F "image=@/path/to/deidentified-scan.png" http://127.0.0.1:8000/predict
+```
+
+The JSON response includes `score`, `threshold`, `above_threshold`, `architecture`, a checkpoint hash prefix (`checkpoint`), the Grad-CAM `target`, and `flat_map`. Decode `overlay_png_base64` to recover the overlay as a PNG. The endpoint returns HTTP 422 for unsupported images or files above the upload limits.
+
+## Code and data
+
+| File | Responsibility |
+| --- | --- |
+| [scans.py](scans.py) | Dataset retrieval, manifests, image geometry, and preprocessing |
+| [models.py](models.py) and [train.py](train.py) | Model definitions, optimization, threshold selection, and checkpointing |
+| [explanations.py](explanations.py) and [evaluate.py](evaluate.py) | Grad-CAM, perturbation controls, localization, and evaluation summaries |
+| [review.py](review.py), [app.py](app.py), and [api.py](api.py) | Shared inference, Word reports, Streamlit viewer, and HTTP endpoint |
+| [paper/external_study.py](paper/external_study.py) | Two-model Jiaxing replication and patient-level aggregation |
+
+The original development and internal test used [TN5000](https://doi.org/10.6084/m9.figshare.28455641.v1). The independent Jiaxing study used [ThyUS2Path](https://doi.org/10.6084/m9.figshare.27021604.v1). Consult each dataset’s release page for attribution, access terms, and source documentation.
